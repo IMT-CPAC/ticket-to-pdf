@@ -1,0 +1,434 @@
+#! /usr/bin/python3
+# -*- coding: utf-8 -*-
+
+import traceback
+import json
+import sys
+import argparse
+import datetime
+import gettext
+
+from reportlab.graphics.shapes import Drawing, _DrawingEditorMixin, String
+from reportlab.graphics.charts.lineplots import SimpleTimeSeriesPlot
+from reportlab.lib.colors import PCMYKColor, red, blue, violet, orange, green
+from reportlab.graphics.charts.axes import XTimeValueAxis
+from reportlab.pdfgen import canvas
+import reportlab.lib.pagesizes as pagesizes
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.units import inch
+from reportlab.graphics.charts.legends import LineLegend
+from reportlab.graphics.widgets.markers import makeMarker
+from reportlab.graphics.charts.textlabels import Label
+from reportlab.pdfbase.pdfmetrics import stringWidth
+
+DOMAIN = "ticket-to-pdf"
+
+try:
+    _("test")
+except:
+    _ = lambda s: s
+
+        
+class CycleGraph(_DrawingEditorMixin,Drawing):
+    def __init__(self,ticket=None, width=400,height=200, font_size=14, font_name="Helvetica", *args,**kw):
+        Drawing.__init__(self,width,height,*args,**kw)
+        self._add(self,SimpleTimeSeriesPlot(),name='chart',validate=None,desc=None)
+        self.__font_size = font_size
+        self.__font_name = font_name
+        self.chart.x = 30
+        self.chart.y = 30
+        self.chart.height = 120
+        self.chart.xValueAxis = XTimeValueAxis()
+
+        yGrid = 5
+        minTemp = 20
+        maxTemp = ((float(ticket['setpoint']) - minTemp) * yGrid) / (yGrid - 1) + minTemp - 1
+
+        # print("minTemp %.1f maxTemp %.1f" % (minTemp, maxTemp))
+
+        self.chart.joinedLines = 1
+        self.chart.yValueAxis.valueMin = minTemp
+        self.chart.yValueAxis.valueMax = maxTemp
+
+
+        self._add(self,String(10,10, _(u"Time/Temperature"), fontName=self.__font_name, fontSize=self.__font_size), name='title',validate=None,desc=None)
+
+        chart_line = 0
+
+        self.chart.lines.strokeWidth = 5
+
+        self.chart.xValueAxis.labelTextFormat = lambda t: ('%d:%02d' % (t / 60, t % 60)) if t < 3600 else ('%d:%02d:%02d' % (x / 3600, x / 60 % 60, x % 60))
+
+        self.chart.xValueAxis.labels.fontName = self.__font_name
+        self.chart.xValueAxis.labels.fontSize = self.__font_size
+
+        self.chart.data = []
+
+        # Receives the color legend for use after graph prepared
+        colorNamePairs = []
+
+        if ticket is not None:
+            cycle_start = ticket['log'][0][0]       # When cycle was started
+            cycle_begin = ticket['log'][1][0]       # When sterilization started
+            cycle_end   = ticket['log'][-1][0]      # When sterilization ends
+
+            # Install the 'internal' sensor values (offset to time t0 of first sample)
+            t0 = ticket['log'][0][0]
+            self.chart.data.append([ (item[0] - t0, item[1]) for item in ticket['log'][0:2] ])
+            self.chart.lines[chart_line].strokeColor = red
+            colorNamePairs.append((red, _(u"Internal logger warmup")))
+
+            chart_line += 1
+
+            self.chart.data.append([ (item[0] - t0, item[1]) for item in ticket['log'][1:] ])
+            self.chart.lines[chart_line].strokeColor = blue
+            colorNamePairs.append((blue, _(u"Internal logger cycle")))
+            chart_line += 1
+           
+            # Install the 'details' log sensor values if present
+            if 'details' in ticket:
+                # How long the logger ran before cycle started
+                start_delay = float(ticket['log'][0][0]) - float(ticket['details']['ts'])
+
+                # Kludge to handle incorrect alignment of start_delay in early data logs
+                if abs(start_delay) > 3*3600:
+                    # old_start_delay = start_delay
+
+                    while start_delay < 3600:
+                        start_delay -= 1800         # Adjust down by .5 hours
+
+                    while start_delay < 0:
+                        start_delay += 1800
+
+                    # print("start_delay adjusted from %d to %d" % (old_start_delay, start_delay))
+                # else:
+                #     print("start_delay is %d" % start_delay)
+
+                margin = int((cycle_end - cycle_start) * 0.1)
+                if margin < 30:
+                    margin = 30
+
+                # Find the first item that aligns with the starting temperature of the log
+                cycle_start_index = None
+                cycle_begin_index = None
+                cycle_end_index = None
+                trimmed_logger_data = []
+                
+                for p in ticket['details']['log']:
+                    point_time = p[0] + cycle_start - start_delay
+
+                    if point_time >= cycle_start - margin and point_time <= cycle_end + margin:
+
+                        # Remember where the cut points are located
+                        if point_time >= cycle_start and cycle_start_index is None:
+                            cycle_start_index = len(trimmed_logger_data)
+
+                        if point_time >= cycle_begin and cycle_begin_index is None:
+                            cycle_begin_index = len(trimmed_logger_data)
+
+                        if point_time >= cycle_end and cycle_end_index is None:
+                            cycle_end_index = len(trimmed_logger_data)
+
+                        trimmed_logger_data.append([ point_time - cycle_start, p[1] ])
+
+                if cycle_start_index >= 2:
+                    self.chart.lines[chart_line].strokeColor = green
+                    chart_line += 1
+
+                    # The time before the cycle started (margin)
+                    self.chart.data.append(trimmed_logger_data[:cycle_start_index])
+
+                # The time between start and begin
+                self.chart.data.append(trimmed_logger_data[cycle_start_index:cycle_begin_index+1])
+                self.chart.lines[chart_line].strokeColor = orange
+                colorNamePairs.append((orange, _(u"External logger warmup")))
+                chart_line += 1
+
+                # Actual sterilization cycle
+                self.chart.data.append(trimmed_logger_data[cycle_begin_index:cycle_end_index+1])
+                self.chart.lines[chart_line].strokeColor = violet
+                self.chart.lines[chart_line].symbol = makeMarker('FilledCircle')
+                colorNamePairs.append((violet, _(u"External logger cycle")))
+                chart_line += 1
+
+                # Margin at the end
+                self.chart.data.append(trimmed_logger_data[cycle_end_index:])
+                self.chart.lines[chart_line].strokeColor = green
+                colorNamePairs.append((green, _(u"Outside of cycle")))
+                chart_line += 1
+
+            else:
+                # Only have internal cycle
+                trimmed_logger_data = [ [ item[0] - cycle_begin, item[1] ] for item in ticket['log'] ]
+
+                cycle_start_index = 0
+                cycle_begin_index = 1
+                cycle_end_index = len(trimmed_logger_data)
+
+        # # Add setpoint line
+        # self.chart.data.append([[ 0, ticket['setpoint'] ], [ trimmed_logger_data[-1][0] + margin, ticket['setpoint'] ] ])
+        # self.chart.lines[chart_line].strokeColor = blue
+        # self.chart.lines[chart_line].strokeWidth = 1
+        # chart_line += 1
+
+        # Compute average temperature during sterilization part of cycle
+        average = sum(float(item[1]) for item in trimmed_logger_data[cycle_begin_index:cycle_end_index]) / (cycle_end_index - cycle_begin_index)
+        # print("Average temp %1.f" % average)
+        
+        convert_temp = lambda T: ("%.0f\N{DEGREE SIGN}F" % (T * 9 / 5 + 32)) if ticket['tempformat'] == "F" else ("%.0f\N{DEGREE SIGN}C" % T)
+
+        # Average value to right
+        label = Label()
+        label.angle = 0
+        label.dx = self.width - inch * 1
+        label.dy = 80
+        label.fontName = self.__font_name
+        label.fontSize = self.__font_size
+        # avestring = _(u"Average %.1f\N{DEGREE SIGN}F") if ticket['tempformat'] == "F" else _(u"Average %.1f\N{DEGREE SIGN}C")
+        label.setText(_(u"Average %s") % convert_temp(average))
+        self.add(label)
+        
+        # Y axis label
+        label = Label()
+        label.angle = 90
+        label.dx = -20
+        label.dy = 80
+        label.fontName = self.__font_name
+        label.fontSize = self.__font_size
+        label.setText(_(u"Temperature \N{DEGREE SIGN}F") if ticket['tempformat'] == "F" else _(u"Temperature \N{DEGREE SIGN}C"))
+        
+        self.add(label)
+        self.title.fontSize   = self.__font_size
+
+        self._add(self, LineLegend(), name='legend', validate=None, desc=None)
+
+        self.legend.colorNamePairs   = colorNamePairs
+        self.legend.fontName         = self.__font_name
+        self.legend.fontSize         = self.__font_size
+        self.legend.alignment        ='right'
+        self.legend.dx               = 20
+        self.legend.dxTextSpace      = 2
+        self.legend.boxAnchor        = 'nw'
+        self.legend.subCols.dx       = 0
+        self.legend.subCols.dy       = -2
+        self.legend.subCols.rpad     = 0
+        self.legend.columnMaximum    = 2
+        self.legend.deltax           = 5
+        self.legend.deltay           = 0
+        self.legend.dy               = 5
+        self.legend.y                = -inch * 0.5
+        self.legend.x                = -inch * 0.5
+
+        self.chart.yValueAxis.labelTextFormat = lambda c: (u"%d\N{DEGREE SIGN}" % (c * 9 / 5 + 32)) if ticket['tempformat'] == "F" else (u"%d\N{DEGREE SIGN}" % c)
+        self.chart.yValueAxis.labels.fontName = self.__font_name
+        self.chart.yValueAxis.labels.fontSize = self.__font_size
+
+        # print(json.dumps(self.chart.data))
+
+        self.chart.width = 335
+        self.title.y = 160
+        self.title.x = 115
+
+
+class Ticket(canvas.Canvas):
+    def __init__(self, ticket_data, output_file=None, pagesize=letter, font_size=14, font_name="Helvetica"):
+
+        self.ticket_data = ticket_data
+
+        if output_file is None:
+            timestamp = datetime.datetime.fromtimestamp(float(self.ticket_data['ts']))
+
+            output_file = "%05d-%04d-%02d-%02d-%02d-%02d-%02d-%s-%d.pdf" % (
+                            self.ticket_data['cycle'],
+                            timestamp.year,
+                            timestamp.month,
+                            timestamp.day,
+                            timestamp.hour,
+                            timestamp.minute,
+                            timestamp.second,
+                            self.ticket_data['model'],
+                            self.ticket_data['sn'])
+
+            self.multi_page = False
+
+        else:
+            self.multi_page = True
+
+        super(Ticket, self).__init__(output_file, pagesize)
+
+        self.output_file = output_file
+        self.width, self.height = pagesize
+        self.logo_size = (self.width/4, self.height/8)
+        self.__font_size = font_size
+        self.__font_name = font_name
+
+    def render(self, ticket_data = None):
+        if ticket_data is not None:
+            self.ticket_data = ticket_data
+
+        left_margin = self.width / 8.5
+        vertical_position = self.height - self.height / 11
+
+        img_file = "./rhpro-pro11-logo.png"
+        self.drawImage(img_file, x=self.width - self.logo_size[0] - self.width / 8.5, y=self.height - self.logo_size[1] - self.height / 11, width = self.logo_size[0], height=self.logo_size[1])
+
+        self.setLineWidth(.3)
+        self.setFont(self.__font_name, self.__font_size)
+
+        u = stringWidth(u"Wy", self.__font_name, self.__font_size)
+
+        convert_temp = lambda T: ("%.0f\N{DEGREE SIGN}F" % (T * 9 / 5 + 32)) if self.ticket_data['tempformat'] == "F" else ("%.0f\N{DEGREE SIGN}C" % T)
+        convert_time = lambda V: "%d:%02d:%02d" % (V/3600, V/60%60, V%60) if V >= 3600 else "%d:%02d" % (V/60, V%60)
+
+        self.drawString(left_margin,            vertical_position, _(u"Cycle Number"))
+        self.drawString(left_margin + 2 * inch, vertical_position, "%d" % int(self.ticket_data['cycle']))
+        vertical_position -= u
+
+        self.drawString(left_margin,            vertical_position, _(u"Completed"))
+        self.drawString(left_margin + inch * 2, vertical_position, u"%s" % datetime.datetime.fromtimestamp(float(self.ticket_data['ts'])).ctime())
+        vertical_position -= u
+
+        self.drawString(left_margin,            vertical_position, _(u"Cycle Name"))
+        self.drawString(left_margin + inch * 2, vertical_position, u"%s" % self.ticket_data['cyclename'])
+        vertical_position -= u
+
+        self.drawString(left_margin,            vertical_position, _(u"Cycle Temperature"))
+        self.drawString(left_margin + inch * 2, vertical_position, u"%s" % convert_temp(self.ticket_data['setpoint']))
+        vertical_position -= u
+
+        self.drawString(left_margin,            vertical_position, _(u"Warmup Time"))
+        self.drawString(left_margin + inch * 2, vertical_position, u"%s" % convert_time(self.ticket_data['warmuptime']))
+        vertical_position -= u
+
+        self.drawString(left_margin,     vertical_position, _(u"Cycle Time"))
+        self.drawString(left_margin + inch * 2, vertical_position, u"%s" % convert_time(self.ticket_data['time']))
+        vertical_position -= u
+
+        vertical_position -= u   # Skip line
+
+        self.drawString(left_margin,     vertical_position, _(u"Model"))
+        self.drawString(left_margin + inch * 2, vertical_position, "%s" % self.ticket_data['model'])
+        vertical_position -= u
+
+        self.drawString(left_margin,     vertical_position, _(u"Serial Number"))
+        self.drawString(left_margin + inch * 2, vertical_position, "%s" % self.ticket_data['sn'])
+        vertical_position -= u
+
+        self.drawString(left_margin,     vertical_position, _(u"Software Version"))
+        self.drawString(left_margin + inch * 2, vertical_position, "%s" % self.ticket_data['swversion'])
+        vertical_position -= u
+
+        self.drawString(left_margin,     vertical_position, _(u"External Logger"))
+        if 'details' in self.ticket_data:
+            self.drawString(left_margin + inch * 2, vertical_position, u"%s s/n %s" % (self.ticket_data['details']['logger_model'], self.ticket_data['details']['logger_sn']))
+        else:
+            self.drawString(left_margin + inch * 2, vertical_position, _(u"None"))
+        vertical_position -= u
+
+        ch = CycleGraph(ticket=self.ticket_data, font_size=self.__font_size, font_name=self.__font_name)
+        w, h = ch.wrapOn(self, self.width / 3, self.height / 6)
+
+        # Center graph horizontally on page
+        graph_left_margin = (self.width - w) / 2
+        ch.drawOn(self, graph_left_margin, vertical_position - h)
+
+        vertical_position -= h
+
+        
+        # Output file name at bottom of page
+        self.setFont("Helvetica-Oblique", 8)
+        self.drawString(left_margin, self.height / 11, self.output_file)
+        self.setFont(self.__font_name, self.__font_size)
+
+        if self.multi_page:
+            pagenum = u"%d" % self.getPageNumber()
+
+            textWidth = stringWidth(pagenum, self.__font_name, self.__font_size)
+
+            self.drawString(self.width - textWidth - self.width / 8.5 , self.height / 11, pagenum)
+
+        self.showPage()
+
+def main():
+    rc = 0
+
+    parser = argparse.ArgumentParser(description='Ticket to PDF renderer')
+
+    parser.add_argument('-s', '--size', default='letter', help=(u"Page size"))
+    parser.add_argument('-D', '--output_dir', default='.', help=(u"Output directory"))
+    parser.add_argument('-l', '--language', default='en', help=(u"Language code"))
+    parser.add_argument('-o', '--onefile', default='', help=(u"Output all tickets to one file"))
+    parser.add_argument('-p', '--progress', default=False, action='store_true', help=(u"Output progress information ['n' of 'm']"))
+    parser.add_argument('-S', '--fontsize', default=14, help=(u"Font size"))
+    parser.add_argument('-F', '--fontname', default='Helvetica', help=(u"Font name"))
+    parser.add_argument('tickets', nargs='*', help=(u"Path of a ticket file"))
+
+    args = parser.parse_args()
+ 
+    # print("Current lang code is %s" % (args.language))
+
+    try:
+        t = gettext.translation(DOMAIN, languages=[args.language])
+        t.install(unicode=True)
+
+        # print("Finished with language init: 'Yes' = '%s'" % (_(u"Yes")))
+
+    except:
+        # Ignore failure - use default language
+        pass
+
+    try:
+        page_size = eval("pagesizes.%s" % args.size)
+
+    except Exception as e:
+        print("Invalid page size (%s), defaulting to 'letter'" % (args.size), file=sys.stderr)
+        page_size = eval("pagesizes.letter")
+       
+    if len(args.tickets) == 0:
+        try:
+            # Process one ticket from stdin
+            ticket_data = json.loads(sys.stdin.read())
+            ticket = Ticket(ticket_data, pagesize=page_size, font_size=int(args.fontsize), font_name=args.fontname)
+            ticket.render()
+            ticket.save()
+
+        except Exception as e:
+            print("Not processing stdin: %s" % (str(e)), file=sys.stderr)
+            traceback.print_exc()
+            rc = 1
+
+    else:
+        file_number = 1
+        if args.onefile != '':
+            ticket = Ticket(ticket_data = None, output_file = args.onefile, pagesize=page_size, font_size=int(args.fontsize), font_name=args.fontname)
+            for file in args.tickets:
+                with open(file) as f:
+                    ticket_data = json.loads(f.read())
+                    ticket.render(ticket_data)
+                    if args.progress:
+                        print("%d of %d" % (file_number, len(args.tickets)))
+                        file_number += 1
+            ticket.save()
+                
+        else:
+            for file in args.tickets:
+                with open(file) as f:
+                    try:
+                        ticket_data = json.loads(f.read())
+                        ticket = Ticket(ticket_data, pagesize=page_size, font_size=int(args.fontsize), font_name=args.fontname)
+                        ticket.render()
+                        ticket.save()
+                        if args.progress:
+                            print("%d of %d" % (file_number, len(args.tickets)))
+                            file_number += 1
+
+                    except Exception as e:
+                        print("Not processing %s: %s" % (file, str(e)), file=sys.stderr)
+                        traceback.print_exc()
+                        rc += 1
+
+    return rc
+
+if __name__ == "__main__":
+    sys.exit(main())
+

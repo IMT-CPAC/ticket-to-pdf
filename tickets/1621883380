@@ -1,0 +1,31 @@
+{
+   "autoprint": false,
+   "cycle": 110,
+   "cyclename": "testing",
+   "dateformat": "MDY",
+   "log": [
+      [
+         1621882426.8009121,
+         25.795682649264641
+      ],
+      [
+         1621883319.8866789,
+         189.71427799930956
+      ],
+      [
+         1621883380.2152593,
+         188.26541581233161
+      ]
+   ],
+   "model": "pro11combined",
+   "printer": "epson",
+   "reported": 1621890225.0480154,
+   "setpoint": 191.59999999999999,
+   "sn": 1,
+   "swversion": "2.3.beta4",
+   "tempformat": "F",
+   "time": 60,
+   "timeformat": 24,
+   "ts": "1621883380",
+   "warmuptime": 120
+}
